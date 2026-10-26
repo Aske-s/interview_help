@@ -10,8 +10,8 @@
 
 | 系统 | 位置 |
 | --- | --- |
-| macOS | `~/Library/Application Support/suisi-local/data/settings.json` |
-| Windows | `%APPDATA%\suisi-local\data\settings.json` |
+| macOS | `~../data/settings.json` |
+| Windows | `%APPDATA%\..\data\settings.json` |
 
 ### 1. 模型网关（必填）
 
@@ -98,4 +98,4 @@ macOS/Linux 终端若注入了 Electron 不支持的 `NODE_OPTIONS`，可用 `en
 
 ## 免责
 
-本项目用于辅助表达与复习。**技术能力始终来自你自己的积累**，请不要用它替代真实的学习与思考。
+本项目用于辅助表达与复习。**技术能力始终来自你自己的积累**，请不要用它替代真实的学习与思考。祝你一切顺利！如果对你有用给个🌟！
