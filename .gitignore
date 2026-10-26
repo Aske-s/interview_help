@@ -1,0 +1,33 @@
+# 依赖与构建产物
+node_modules/
+out/
+dist/
+*.tsbuildinfo
+.compiled*.cjs
+
+# ------------------------------------------------------------------
+# 密钥：绝不能进仓库
+#
+# 本项目所有密钥（模型网关 API Key、语音识别 Key）都在应用内「高级设置」里填写，
+# 运行时保存在系统的应用数据目录，不经过仓库：
+#   macOS   ~/Library/Application Support/<应用名>/data/settings.json
+#   Windows %APPDATA%\<应用名>\data\settings.json
+# 下面这些规则是防呆：万一你把密钥写进了 .env 或临时文件，也不会被提交。
+# ------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.json
+settings.json
+
+# 原生 helper 的编译产物（源码在 native/*/，用 npm run build:native 生成）
+native/cursor-hide/cursor-hide
+native/keyboard-guard/keyboard-guard
+native/system-audio/capture-sck
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
+*.log
