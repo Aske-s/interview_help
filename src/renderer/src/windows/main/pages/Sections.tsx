@@ -21,6 +21,7 @@ import type {
   KnowledgeBase,
   Mode,
   KnowledgeDocument,
+  KnowledgePurpose,
   ProviderConfig,
   RetrievedChunk,
   SessionRecord,
@@ -228,9 +229,13 @@ export function Knowledge(): React.ReactElement {
   const [activeKb, setActiveKb] = React.useState<string | null>(null)
   const [docs, setDocs] = React.useState<KnowledgeDocument[]>([])
   const [newName, setNewName] = React.useState('')
+  const [newPurpose, setNewPurpose] = React.useState<KnowledgePurpose>('general')
   const [hits, setHits] = React.useState<RetrievedChunk[]>([])
   const [query, setQuery] = React.useState('')
   const [status, setStatus] = React.useState('')
+
+  /** 当前选中的知识库对象（用于展示/切换用途） */
+  const activeKb_item = kbs.find((kb) => kb.id === activeKb) ?? null
 
   const reload = React.useCallback(async () => {
     const list = await api.knowledge.list()
@@ -248,7 +253,8 @@ export function Knowledge(): React.ReactElement {
       return
     }
     void api.knowledge.listDocuments(activeKb).then(setDocs)
-  }, [activeKb, status])
+    void reload()
+  }, [activeKb, status, reload])
 
   const importFile = async (): Promise<void> => {
     if (!activeKb) return
@@ -282,14 +288,46 @@ export function Knowledge(): React.ReactElement {
             placeholder="新知识库名称"
             className="w-[180px]"
           />
+          <Select
+            value={newPurpose}
+            onChange={(e) => setNewPurpose(e.target.value as KnowledgePurpose)}
+            className="w-[132px]"
+          >
+            <option value="general">通用（检索）</option>
+            <option value="resume">简历</option>
+            <option value="quiz">题库</option>
+          </Select>
           <Button
             variant="primary"
+            /*
+             * 名称为空时直接禁用，而不是点了静默 return ——
+             * 后者对用户就是「点了没反应」，很难自己定位。
+             */
+            disabled={!newName.trim()}
+            title={newName.trim() ? '创建知识库' : '请先填写知识库名称'}
             onClick={() => {
-              if (!newName.trim()) return
-              void api.knowledge.create(newName.trim()).then((list) => {
-                setKbs(list)
-                setNewName('')
-              })
+              if (!newName.trim()) {
+                setStatus('请先填写知识库名称')
+                return
+              }
+              setStatus('正在创建…')
+              void api.knowledge
+                .create(newName.trim(), undefined, newPurpose)
+                .then((list) => {
+                  setKbs(list)
+                  /*
+                   * 新建的库在列表最前面（集合是"新的在前"）。这里主动切过去：
+                   * 否则右侧还停在旧库上，看起来就像"没创建成功"。
+                   */
+                  const created = list[0]
+                  if (created) setActiveKb(created.id)
+                  setStatus(`已创建「${created?.name ?? newName.trim()}」，可以导入文档了`)
+                  setNewName('')
+                  setNewPurpose('general')
+                })
+                .catch((error: unknown) => {
+                  setStatus(`创建失败：${error instanceof Error ? error.message : String(error)}`)
+                })
             }}
           >
             创建知识库
@@ -306,6 +344,11 @@ export function Knowledge(): React.ReactElement {
               kbs.map((kb) => (
                 <ListRow key={kb.id} active={kb.id === activeKb} onClick={() => setActiveKb(kb.id)}>
                   <span className="min-w-0 flex-1 truncate text-[13px]">{kb.name}</span>
+                  {kb.purpose && kb.purpose !== 'general' && (
+                    <Badge tone={kb.purpose === 'resume' ? 'ok' : 'warn'}>
+                      {kb.purpose === 'resume' ? '简历' : '题库'}
+                    </Badge>
+                  )}
                   <Button
                     size="sm"
                     variant="ghost"
@@ -326,6 +369,57 @@ export function Knowledge(): React.ReactElement {
           <div className="space-y-4">
             {activeKb ? (
               <>
+                <Card title="用途">
+                  <div className="flex items-center gap-3">
+                    <Select
+                      value={activeKb_item?.purpose ?? 'general'}
+                      onChange={(e) => {
+                        void api.knowledge.setPurpose(activeKb, e.target.value as KnowledgePurpose).then(setKbs)
+                      }}
+                      className="w-[160px]"
+                    >
+                      <option value="general">通用（检索）</option>
+                      <option value="resume">简历</option>
+                      <option value="quiz">题库</option>
+                    </Select>
+                    <div className="min-w-0 flex-1 text-[12px] leading-relaxed text-[rgb(var(--ss-muted))]">
+                      {(activeKb_item?.purpose ?? 'general') === 'resume'
+                        ? '上传后由大模型提炼成一份精炼的「速查卡」存下来，之后每次答问只注入这份速查卡（约 1200 字），既贴事实又不占上下文。'
+                        : (activeKb_item?.purpose ?? 'general') === 'quiz'
+                          ? '整份注入到截图解题的提示词里，作为同类题的解法与模板参考（适合几千字以内的题库）。'
+                          : '按当前问题做相似度检索，只注入最相关的几块。适合资料量大、按需查阅的内容。'}
+                    </div>
+                  </div>
+                  {(activeKb_item?.purpose ?? 'general') === 'resume' && (
+                    <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-[rgb(var(--ss-border))] pt-3">
+                      {activeKb_item?.profile ? (
+                        <Badge tone="ok">速查卡 {activeKb_item.profile.length} 字</Badge>
+                      ) : (
+                        <Badge tone="warn">还没生成速查卡</Badge>
+                      )}
+                      {activeKb_item?.profileAt && (
+                        <span className="ss-list-count">
+                          {new Date(activeKb_item.profileAt).toLocaleString('zh-CN', { hour12: false })}
+                        </span>
+                      )}
+                      <Button
+                        size="sm"
+                        onClick={async () => {
+                          if (!activeKb) return
+                          setStatus('正在解析简历（会调用一次模型，约 10 秒）…')
+                          const res = await api.knowledge.distillResume(activeKb)
+                          setStatus(res.ok ? `速查卡已生成：${res.chars} 字` : `解析失败：${res.error}`)
+                          await reload()
+                        }}
+                      >
+                        {activeKb_item?.profile ? '重新解析' : '解析简历'}
+                      </Button>
+                      {!activeKb_item?.profile && (
+                        <span className="ss-list-count">未生成时仍会用简历原文兜底，不影响使用</span>
+                      )}
+                    </div>
+                  )}
+                </Card>
                 <Card
                   title={`文档（${docs.length}）`}
                   extra={

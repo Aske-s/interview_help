@@ -8,8 +8,9 @@ import { runStream, cancelStream } from '../gateway/stream-manager'
 import { chatComplete } from '../gateway/llm'
 import { isSelf, similarity } from '../voiceprint'
 import { loadProfile } from '../voiceprint/store'
-import { appendQa, appendTranscript, createSession } from '../ipc/data'
+import { appendQa, appendTranscript, attachMyAnswer, createSession } from '../ipc/data'
 import { retrieveContext } from '../knowledge'
+import { contextByPurpose } from '../knowledge'
 import { getWindow } from '../windows'
 import type { ChatDelta, ChatMessage, LiveState, QaRecord, SessionKind, SessionRecord, TranscriptSegment } from '@shared/types'
 
@@ -77,17 +78,66 @@ const RECORDER_PATTERNS = [
  * 而不是只塞一段原始转写。
  */
 const DEFAULT_MEMORY_ROUNDS = 10
-/** 单条历史答案最多保留多少字符（长回答只留开头，够维持连贯即可） */
-const HISTORY_ANSWER_MAX_CHARS = 600
 
-/** 截断历史答案，避免一轮很长的回答把上下文预算吃光 */
-function clipAnswer(text: string, max = HISTORY_ANSWER_MAX_CHARS): string {
-  const clean = String(text ?? '').trim()
-  if (clean.length <= max) return clean
-  return `${clean.slice(0, max)}…`
+/**
+ * 发给模型的历史上下文总字符预算。
+ *
+ * 为什么要有：长面试（几十轮）逐轮累加会把提示词撑到几万 token，
+ * 首字延迟和费用都会失控。所以除了轮数上限，再加一道字符预算。
+ */
+const CONTEXT_CHAR_BUDGET = 6000
+/**
+ * 简历整份注入的字符上限。
+ *
+ * 简历通常 1~3k 字，正常不会被截；设上限是防止有人把整本简历库塞进来
+ * 把提示词撑爆。超了保留头部 —— 简历一般是倒序的，头部就是基本信息 + 最近经历，
+ * 正是面试最常问的部分。
+ */
+const RESUME_CONTEXT_MAX_CHARS = 3000
+/** 「我实际回答」保留策略：首部（结论/立场）+ 尾部（补充/收尾），中间例子可丢 */
+const MY_ANSWER_HEAD = 220
+const MY_ANSWER_TAIL = 230
+/** 「上次给的建议」只留开头，够判断方向即可 */
+const ADVICE_MAX = 500
+
+/**
+ * 首尾截断。
+ *
+ * 为什么不是简单取开头：人的回答结构是「先给结论 → 中间举例 → 最后补充」，
+ * 追问通常打在结论和最后一句补充上，中间的例子反而最不重要。
+ * 这个策略零延迟、零 token，却能覆盖大部分"摘要"的价值。
+ */
+function clipMiddle(text: string, head: number, tail: number): string {
+  const clean = String(text ?? '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (clean.length <= head + tail + 10) return clean
+  // 注意：tail 为 0 时绝不能写 clean.slice(-0) —— 那是 slice(0)，等于整段。
+  const tailPart = tail > 0 ? clean.slice(-tail) : ''
+  return tailPart ? `${clean.slice(0, head)}…（中略）…${tailPart}` : `${clean.slice(0, head)}…`
+}
+
+/**
+ * 一轮问答：面试官问了什么、我实际答了什么、当时给了什么建议。
+ *
+ * 三者缺一不可 —— 只给建议不知道自己答了什么，模型会重复建议；
+ * 只给转写没有建议，模型不知道上一轮的口径。
+ */
+interface LiveTurn {
+  question: string
+  /** 我在这一轮里说的话（麦克风转写累积） */
+  answerText: string
+  /** 当时生成的建议答案 */
+  advice: string
+  qaId?: string
 }
 
 class LiveOrchestrator extends EventEmitter {
+  /** 已结束的轮次（用于组上下文，内存里只留最近若干轮） */
+  private turns: LiveTurn[] = []
+  /** 正在进行的这一轮（面试官刚问、我还没答完） */
+  private currentTurn: LiveTurn | null = null
+
   private state: LiveState = {
     hearing: false,
     audioFrames: 0,
@@ -158,6 +208,9 @@ class LiveOrchestrator extends EventEmitter {
     this.buffers = { mic: emptyBuffer(), system: emptyBuffer() }
     this.pendingQuestion = ''
     this.currentQaId = null
+    // 新会话不继承上一场的轮次上下文
+    this.turns = []
+    this.currentTurn = null
     // 每次开新会话时刷新声纹模板（用户可能刚录入）
     this.voiceprintProfile = loadProfile()
 
@@ -200,6 +253,8 @@ class LiveOrchestrator extends EventEmitter {
     // 收尾：把残留音频也识别掉
     this.flush('mic', true)
     this.flush('system', true)
+    // 最后一轮也要把"我实际回答了什么"落库
+    this.closeTurn()
     if (this.currentQaId) cancelStream(this.currentQaId)
 
     this.state = {
@@ -278,6 +333,51 @@ class LiveOrchestrator extends EventEmitter {
     })
   }
 
+  /**
+   * 这句话是不是「我自己」说的。
+   *
+   * 判定顺序：
+   *   1. 声纹明确给了结论就用它（线下场景只有麦克风时唯一的依据）
+   *   2. 否则看音源：同时采集电脑音频时，麦克风就是我方、系统音频就是对方
+   *   3. 只开麦克风（面对面）且没开声纹时，无法区分 —— 一律按对方处理，
+   *      宁可多答一句，也不要把真正的问题吞掉
+   */
+  private isOwnVoice(source: 'mic' | 'system', speaker?: 'self' | 'other'): boolean {
+    if (speaker === 'self') return true
+    if (speaker === 'other') return false
+    return source === 'mic' && settingsStore.get().audio.systemAudioEnabled
+  }
+
+  /** 把我说的话累积到当前轮里 */
+  private appendMyAnswer(text: string): void {
+    const clean = text.trim()
+    if (!clean) return
+    if (!this.currentTurn) {
+      // 还没提问就说话（例如面试官寒暄阶段的回应）：开一个无名轮兜住
+      this.currentTurn = { question: '', answerText: '', advice: '' }
+    }
+    this.currentTurn.answerText = this.currentTurn.answerText
+      ? `${this.currentTurn.answerText} ${clean}`
+      : clean
+  }
+
+  /**
+   * 结束当前轮：把「我实际回答了什么」回填到对应的问答记录，并归档进上下文。
+   * 在下一句问题提交时调用（此时我的回答已经说完了）。
+   */
+  private closeTurn(): void {
+    const turn = this.currentTurn
+    this.currentTurn = null
+    if (!turn) return
+    if (turn.answerText && this.session && turn.qaId) {
+      // 落盘字段留长一点（复盘要看），发送给模型时再按预算截断
+      attachMyAnswer(this.session.id, turn.qaId, turn.answerText.slice(0, 4000))
+    }
+    if (turn.question || turn.answerText) this.turns.push(turn)
+    // 内存里最多留 40 轮，避免超长会议无限增长
+    if (this.turns.length > 40) this.turns.splice(0, this.turns.length - 40)
+  }
+
   /** 流式定稿 → 复用既有的转写落库与提问判定链路 */
   private ingestStreamingFinal(text: string, source: 'mic' | 'system'): void {
     const clean = text.trim()
@@ -293,6 +393,15 @@ class LiveOrchestrator extends EventEmitter {
     if (this.session) appendTranscript(this.session.id, segment)
     this.emit('transcript', segment)
     this.setState({ lastTranscript: clean, asr: 'listening' })
+
+    /*
+     * 分流：我说的话只用来构建上下文，**绝不能当成问题去提问**。
+     * 以前不区分音源，开了麦克风之后会把自己说的内容也拿去问模型。
+     */
+    if (this.isOwnVoice(source)) {
+      this.appendMyAnswer(clean)
+      return
+    }
     this.stitch(clean)
   }
 
@@ -478,8 +587,11 @@ class LiveOrchestrator extends EventEmitter {
         this.emit('transcript', segment)
         this.setState({ lastTranscript: text, asr: 'listening', voiceprintEnrolled: Boolean(profile) })
 
-        // 自己说的话不作为提问来源
-        if (speaker === 'self') return
+        // 我说的话只进上下文，不作为提问来源
+        if (this.isOwnVoice(source, speaker)) {
+          this.appendMyAnswer(text)
+          return
+        }
         this.stitch(text)
       } catch (error) {
         this.setState({ asr: 'error' })
@@ -558,6 +670,9 @@ class LiveOrchestrator extends EventEmitter {
 
     const prompt = (question ?? this.pendingQuestion).trim()
     if (!prompt) return
+    // 新一轮开始 = 上一轮结束：把我的回答归到上一轮，并归档进上下文
+    this.closeTurn()
+    this.currentTurn = { question: prompt, answerText: '', advice: '' }
     if (this.commitTimer) clearTimeout(this.commitTimer)
     this.pendingQuestion = ''
     /*
@@ -612,6 +727,22 @@ class LiveOrchestrator extends EventEmitter {
             trigger
           }
           if (this.session) appendQa(this.session.id, record)
+          /*
+           * 把这一条建议挂到对应轮次上。
+           * 通常此时 currentTurn 就是它；但如果我在建议还没生成完就开始回答、
+           * 下一句问题又提前到了，这条会落到已归档的轮次里 —— 两种都要覆盖。
+           */
+          const turn =
+            this.currentTurn?.question === prompt
+              ? this.currentTurn
+              : [...this.turns].reverse().find((item) => item.question === prompt && !item.advice)
+          if (turn) {
+            turn.qaId = qaId
+            turn.advice = result.text
+            if (turn.answerText && this.session) {
+              attachMyAnswer(this.session.id, qaId, turn.answerText.slice(0, 4000))
+            }
+          }
           this.currentQaId = null
           this.setState({ streaming: false })
           this.emit('answerDone', {
@@ -641,6 +772,16 @@ class LiveOrchestrator extends EventEmitter {
       '【要求】\n直接给出可以照着念的答案，不要复述问题，不要输出“作为AI”之类的话。信息不足时给出可用的框架性回答。'
     )
 
+    /*
+     * 简历：整份注入，而不是按问题检索。
+     * 面试里大量问题都是「介绍一下你自己 / 讲讲你的项目」这类，
+     * 用相似度检索反而不稳（问题里不含简历里的关键名词时捞不到）。
+     */
+    const resume = contextByPurpose('resume', RESUME_CONTEXT_MAX_CHARS)
+    if (resume) {
+      parts.push(`【我的简历 / 背景】（回答时以这里的事实为准，不要编造经历）\n${resume}`)
+    }
+
     // 知识库召回（失败静默降级）
     if (agent?.knowledgeBaseIds?.length) {
       const chunks = await retrieveContext(agent.knowledgeBaseIds, question, 4)
@@ -651,29 +792,40 @@ class LiveOrchestrator extends EventEmitter {
       }
     }
 
-    // 最近转写作为对话上下文
-    const recent = this.session?.transcript.slice(-8) ?? []
-    if (recent.length) {
-      const ctx = recent.map((s) => `${s.source === 'mic' ? '我方' : '对方'}：${s.text}`).join('\n')
-      parts.push(`【当前对话上下文】\n${ctx}`)
-    }
-
     /*
-     * 历史问答作为**真正的对话轮次**带上。
+     * 历史轮次：最近几轮「面试官问了什么 / 我实际怎么答的 / 当时建议了什么」。
      *
-     * 之前只带一段原始转写、不带自己答过的内容，模型根本不知道上一句答了什么，
-     * 被追问时容易重复、跑题甚至自相矛盾（"回答不够关联"的根因）。
-     * 原版工作流的做法是 memory.window 里保留 10 轮、并用 role_prefix 区分
-     * user / assistant，这里对齐它的语义。
+     * 面试的追问几乎都锚定在上一轮的具体细节上（尤其是项目拆解：
+     * "你刚说用了 Redis，那缓存一致性怎么保证"），所以必须带上"我实际说了什么"，
+     * 否则模型只能凭上一轮的建议重答一遍，前后会打架。
+     *
+     * 两道闸：轮数上限（memoryRounds）+ 总字符预算，谁先到算谁。
      */
     const rounds = Math.max(0, agent?.memoryRounds ?? DEFAULT_MEMORY_ROUNDS)
-    const history: ChatMessage[] = []
-    if (rounds > 0 && this.session) {
-      for (const record of this.session.qa.slice(-rounds)) {
-        if (!record.question || !record.answer) continue
-        history.push({ role: 'user', content: record.question })
-        history.push({ role: 'assistant', content: clipAnswer(record.answer) })
+    const window: LiveTurn[] = []
+    let used = 0
+    if (rounds > 0) {
+      for (let i = this.turns.length - 1; i >= 0 && window.length < rounds; i--) {
+        const turn = this.turns[i]
+        if (!turn.question && !turn.answerText) continue
+        const cost =
+          turn.question.length +
+          Math.min(turn.answerText.length, MY_ANSWER_HEAD + MY_ANSWER_TAIL) +
+          Math.min(turn.advice.length, ADVICE_MAX)
+        // 至少留最近一轮，否则完全失去连贯性
+        if (window.length > 0 && used + cost > CONTEXT_CHAR_BUDGET) break
+        window.unshift(turn)
+        used += cost
       }
+    }
+
+    const history: ChatMessage[] = []
+    for (const turn of window) {
+      const said: string[] = []
+      if (turn.question) said.push(`面试官：${turn.question}`)
+      if (turn.answerText) said.push(`我实际回答：${clipMiddle(turn.answerText, MY_ANSWER_HEAD, MY_ANSWER_TAIL)}`)
+      history.push({ role: 'user', content: said.join('\n') })
+      if (turn.advice) history.push({ role: 'assistant', content: clipMiddle(turn.advice, ADVICE_MAX, 0) })
     }
 
     return [
@@ -770,6 +922,9 @@ class LiveOrchestrator extends EventEmitter {
 
   clear(): void {
     this.pendingQuestion = ''
+    // 清空上下文：把最后一轮尽量收尾落库，然后丢弃轮次
+    this.closeTurn()
+    this.turns = []
     if (this.currentQaId) cancelStream(this.currentQaId)
     this.currentQaId = null
     this.stopStreaming()

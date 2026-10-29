@@ -128,13 +128,16 @@ exit 5
 
 /* ---------- 环境变量小工具 ---------- */
 /*
- * 快速路径用宽裕超时（3000ms）。
- * 原先统一设 600ms，在整套测试并发跑、系统负载高时，连「立即退出的桩」都会被判成
- * 探测超时，于是「原因来自 helper」这条断言偶发失败——这是测试自身的不稳定，不是实现问题。
- * 真正要验证超时保护的用例（2b）会自己把超时调回 600ms。
+ * 快速路径用**很宽裕**的超时（10s）。
+ *
+ * 教训：原先设 600ms，后来提到 3000ms，仍然偶发失败 —— 在整套测试链并发跑、
+ * 机器负载高时，连「立即退出的桩」都可能被排到 3 秒之后才被调度到，
+ * 于是被判成「探测超时」，让「原因来自 helper」这条断言误报。这是测试自身的
+ * 不稳定，不是实现问题。这里的断言根本不看耗时，所以直接把预算拉大。
+ * 真正要验证超时保护的用例（2b）会自己调回 600ms。
  */
-process.env.SUISI_KEYBOARD_GUARD_PROBE_TIMEOUT_MS = '3000'
-process.env.SUISI_KEYBOARD_GUARD_READY_TIMEOUT_MS = '2000'
+process.env.SUISI_KEYBOARD_GUARD_PROBE_TIMEOUT_MS = '10000'
+process.env.SUISI_KEYBOARD_GUARD_READY_TIMEOUT_MS = '8000'
 
 const kg = require(path.join(ROOT, 'src/main/keyboard-guard/index.ts'))
 
@@ -184,7 +187,7 @@ async function main() {
   const t0 = Date.now()
   const s2b = kg.getSupport()
   const elapsed = Date.now() - t0
-  process.env.SUISI_KEYBOARD_GUARD_PROBE_TIMEOUT_MS = '3000'
+  process.env.SUISI_KEYBOARD_GUARD_PROBE_TIMEOUT_MS = '10000'
   check('2b. probe 卡住：带超时返回（上层不卡死）', elapsed < 2000, `实测 ${elapsed}ms（预算 600ms）`)
   check('2b. probe 卡住：原因为超时', /超时/.test(s2b.reason ?? ''), s2b.reason)
   check('2b. probe 卡住：ok=false', s2b.ok === false)

@@ -8,10 +8,14 @@ import { isScreenPermissionError, ScreenPermissionError } from '../capture'
 import { openPrivacySettings, requestPermission } from '../diagnostics/devices'
 import { activeProvider, settingsStore } from '../store/settings'
 import { runStream } from '../gateway/stream-manager'
+import { contextByPurpose } from '../knowledge'
 import { randomUUID } from 'node:crypto'
 import type { ChatContentPart, ChatMessage } from '@shared/types'
 
 /** 截图解题：选区截图 → 多模态识别 → 流式答案 */
+
+/** 题库整份注入的字符上限（没有题面文本可检索，只能整份给） */
+const QUIZ_CONTEXT_MAX_CHARS = 4000
 
 let pendingSource = ''
 let currentRequestId: string | null = null
@@ -47,8 +51,19 @@ async function answerImage(dataUrl: string, prompt?: string): Promise<void> {
   currentRequestId = reqId
 
   const content: ChatContentPart[] = [{ type: 'text', text: prompt?.trim() || defaultPrompt() }, imagePart(dataUrl)]
+  /*
+   * 题库：整份注入成参考资料。
+   *
+   * 这里没有"题面文本"可以拿去做检索（我们直接把图片丢给多模态模型），
+   * 所以按相似度捞是做不到的，只能整份给 —— 只适合几百到几千字的题库
+   * （往年真题、常见题型、代码模板）。超过预算会截断。
+   */
+  const quizBank = contextByPurpose('quiz', QUIZ_CONTEXT_MAX_CHARS)
+  const system = quizBank
+    ? `你是一名擅长读题与解题的助手，输出要直接可用。\n\n【参考题库】（同类题的解法与模板，若与当前题目相关请优先参考）\n${quizBank}`
+    : '你是一名擅长读题与解题的助手，输出要直接可用。'
   const messages: ChatMessage[] = [
-    { role: 'system', content: '你是一名擅长读题与解题的助手，输出要直接可用。' },
+    { role: 'system', content: system },
     { role: 'user', content }
   ]
 

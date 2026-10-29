@@ -1,8 +1,16 @@
 import { ipcMain } from 'electron'
 import { randomUUID } from 'node:crypto'
 import { IPC } from '@shared/ipc'
-import { addDocument, knowledgeStore, removeDocument, removeKb, search } from '../knowledge'
-import type { KnowledgeBase, KnowledgeDocument, Result, RetrievedChunk } from '@shared/types'
+import {
+  addDocument,
+  distillResume,
+  invalidateResumeProfile,
+  knowledgeStore,
+  removeDocument,
+  removeKb,
+  search
+} from '../knowledge'
+import type { KnowledgeBase, KnowledgeDocument, Result, RetrievedChunk, KnowledgePurpose } from '@shared/types'
 
 /**
  * 知识库 IPC：与 shared/ipc.ts 的 KnowledgeApi 一一对应，共 7 个通道。
@@ -17,18 +25,35 @@ export function registerKnowledgeIpc(): void {
       .sort((a, b) => b.updatedAt - a.updatedAt)
   )
 
-  ipcMain.handle(IPC.KbCreate, (_e, name: string, description?: string): KnowledgeBase[] => {
-    const now = Date.now()
-    const kb: KnowledgeBase = {
-      id: randomUUID(),
-      name: (name ?? '').trim() || '未命名知识库',
-      description,
-      createdAt: now,
-      updatedAt: now
+  ipcMain.handle(
+    IPC.KbCreate,
+    (_e, name: string, description?: string, purpose?: KnowledgePurpose): KnowledgeBase[] => {
+      const now = Date.now()
+      const kb: KnowledgeBase = {
+        id: randomUUID(),
+        name: (name ?? '').trim() || '未命名知识库',
+        description,
+        purpose: purpose ?? 'general',
+        createdAt: now,
+        updatedAt: now
+      }
+      knowledgeStore.kbs.upsert(kb)
+      return knowledgeStore.kbs.all()
     }
-    knowledgeStore.kbs.upsert(kb)
+  )
+
+  /** 改知识库用途（简历 / 题库 / 通用） */
+  ipcMain.handle(IPC.KbSetPurpose, (_e, kbId: string, purpose: KnowledgePurpose): KnowledgeBase[] => {
+    const kb = knowledgeStore.kbs.all().find((item) => item.id === kbId)
+    if (kb) {
+      kb.purpose = purpose
+      kb.updatedAt = Date.now()
+      knowledgeStore.kbs.upsert(kb)
+    }
     return knowledgeStore.kbs.all()
   })
+
+  ipcMain.handle(IPC.KbDistillResume, (_e, kbId: string) => distillResume(kbId))
 
   ipcMain.handle(IPC.KbDelete, (_e, id: string): KnowledgeBase[] => {
     removeKb(id)
@@ -37,11 +62,25 @@ export function registerKnowledgeIpc(): void {
 
   ipcMain.handle(
     IPC.KbAddDocument,
-    (_e, kbId: string, payload: { path?: string; name?: string; text?: string }): Promise<Result<KnowledgeDocument>> =>
-      addDocument(kbId, payload ?? {})
+    async (_e, kbId: string, payload: { path?: string; name?: string; text?: string }): Promise<Result<KnowledgeDocument>> => {
+      const result = await addDocument(kbId, payload ?? {})
+      if (!result.ok) return result
+      const kb = knowledgeStore.kbs.all().find((item) => item.id === kbId)
+      if ((kb?.purpose ?? 'general') === 'resume') {
+        // 内容变了，旧速查卡作废；后台重新提炼，不拖慢导入
+        invalidateResumeProfile(kbId)
+        void distillResume(kbId)
+      }
+      return result
+    }
   )
 
-  ipcMain.handle(IPC.KbRemoveDocument, (_e, docId: string): void => removeDocument(docId))
+  ipcMain.handle(IPC.KbRemoveDocument, (_e, docId: string): void => {
+    const doc = knowledgeStore.docs.all().find((item) => item.id === docId)
+    removeDocument(docId)
+    // 删掉文档后速查卡就过期了，清掉（下次导入会重新生成）
+    if (doc) invalidateResumeProfile(doc.kbId)
+  })
 
   ipcMain.handle(IPC.KbListDocuments, (_e, kbId: string): KnowledgeDocument[] =>
     knowledgeStore.docs

@@ -260,3 +260,4 @@ export async function scanEnvironment(): Promise<SecurityCheckResult> {
   setSecurityCheck(result)
   return result
 }
+

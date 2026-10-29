@@ -175,6 +175,14 @@ export interface QaRecord {
   createdAt: number
   /** 触发方式 */
   trigger: 'auto' | 'manual' | 'screenshot'
+  /**
+   * 这一轮里**候选人自己**说的话（麦克风转写）。
+   *
+   * 追问几乎都锚定在「你刚才讲了什么 / 漏了什么」上，所以这个字段是
+   * 后续回答连贯性的关键：只有建议答案、不知道自己实际答了什么，模型就会
+   * 重复建议或者答非所问。会话记录里留着它，复盘时也能看出「当时怎么答的」。
+   */
+  myAnswer?: string
 }
 
 export interface SessionRecord {
@@ -231,10 +239,35 @@ export interface KnowledgeDocument {
   createdAt: number
 }
 
+/**
+ * 知识库用途。
+ *
+ * 不同用途的注入方式完全不同，而不是"都拿去做相似度检索"：
+ *  - resume：整份注入成【我的简历】。简历回答（"介绍一下你自己"）需要完整背景，
+ *    按问题检索只会捞到零星片段，反而答得断断续续。
+ *  - quiz  ：整份注入成【参考题库】，用于截图解题时参考同类题的解法/模板。
+ *  - general：维持检索式注入（按当前问题取最相关的几块）。
+ */
+export type KnowledgePurpose = 'general' | 'resume' | 'quiz'
+
 export interface KnowledgeBase {
   id: string
   name: string
   description?: string
+  /** 用途，缺省视为 general */
+  purpose?: KnowledgePurpose
+  /**
+   * 简历用途专用：上传后由大模型一次性提炼出的「速查卡」。
+   *
+   * 为什么不在每次回答时现算：解析一次要一次完整的模型调用（首字几秒），
+   * 而这份内容在整场面试里是不变的。存下来下次直接注入，
+   * 既省时间又省 token —— 精炼后的版本通常只有原文的 1/4。
+   */
+  profile?: string
+  /** 速查卡生成时间 */
+  profileAt?: number
+  /** 生成速查卡时用的模型（换模型后可以据此判断要不要重新解析） */
+  profileModel?: string
   createdAt: number
   updatedAt: number
 }

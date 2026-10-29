@@ -93,6 +93,10 @@ export const IPC = {
   /* 知识库 */
   KbList: 'kb:list',
   KbCreate: 'kb:create',
+  /** 改知识库用途（简历 / 题库 / 通用） */
+  KbSetPurpose: 'kb:set-purpose',
+  /** 把简历知识库提炼成速查卡（上传后跑一次） */
+  KbDistillResume: 'kb:distill-resume',
   KbDelete: 'kb:delete',
   KbAddDocument: 'kb:add-document',
   KbRemoveDocument: 'kb:remove-document',
@@ -258,7 +262,8 @@ import type {
   SessionRecord,
   Settings,
   TodoItem,
-  TranscriptSegment
+  TranscriptSegment,
+  KnowledgePurpose
 } from './types'
 
 export interface StreamHandlers {
@@ -325,7 +330,11 @@ export interface AgentApi {
 
 export interface KnowledgeApi {
   list: () => Promise<KnowledgeBase[]>
-  create: (name: string, description?: string) => Promise<KnowledgeBase[]>
+  /** purpose：resume（简历，整份注入面试作答）/ quiz（题库，注入截图解题）/ general（检索式） */
+  create: (name: string, description?: string, purpose?: KnowledgePurpose) => Promise<KnowledgeBase[]>
+  setPurpose: (kbId: string, purpose: KnowledgePurpose) => Promise<KnowledgeBase[]>
+  /** 提炼简历速查卡；ok=false 时继续用原文兜底 */
+  distillResume: (kbId: string) => Promise<{ ok: boolean; chars?: number; error?: string }>
   remove: (id: string) => Promise<KnowledgeBase[]>
   addDocument: (kbId: string, payload: { path?: string; name?: string; text?: string }) => Promise<Result<KnowledgeDocument>>
   removeDocument: (docId: string) => Promise<void>

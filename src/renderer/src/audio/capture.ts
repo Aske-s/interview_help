@@ -161,10 +161,108 @@ export function drainNativeFrames(
   return { frames, carry: merged.slice(offset) }
 }
 
+/** 开麦结果：是否回退到了系统默认设备 */
+export interface MicOpenResult {
+  stream: MediaStream
+  usedDefaultDevice: boolean
+}
+
+/**
+ * 打开麦克风。
+ *
+ * 为什么需要"回退"：Chromium 的 `deviceId` 是按 profile 加盐的哈希，
+ * 权限状态变化、profile 重建、设备插拔都会让它变。应用里存的是上次选的设备 ID，
+ * 用 `{ exact }` 硬约束一旦失效就抛 OverconstrainedError —— 表现是麦克风完全打不开，
+ * 而界面上只会闪一行错误，「我的回答」永远是空的（很难察觉）。
+ *
+ * 所以：指定设备打不开时，退回系统默认设备，并让调用方知道发生了回退
+ * （调用方可以顺手把失效的 deviceId 清掉，下次不再白试）。
+ */
+export async function openMicStream(
+  deviceId?: string,
+  getUserMedia: (constraints: MediaStreamConstraints) => Promise<MediaStream> = (constraints) =>
+    navigator.mediaDevices.getUserMedia(constraints)
+): Promise<MicOpenResult> {
+  const base: MediaTrackConstraints = { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+  /** 记录每一次尝试的结果，失败时拼进错误文本，免得只看到一句含糊的报错 */
+  const attempts: string[] = []
+  const nameOf = (error: unknown): string =>
+    error instanceof Error && error.name ? error.name : String(error).slice(0, 40)
+  /** 组装错误时保留底层 name，别让上层只能靠 parse 文本判断 */
+  const micError = (lastName: string): Error => {
+    const composed = new Error(`麦克风打开失败（${attempts.join('，')}）`)
+    if (lastName) composed.name = lastName
+    return composed
+  }
+
+  if (deviceId) {
+    try {
+      return { stream: await getUserMedia({ audio: { ...base, deviceId: { exact: deviceId } } }), usedDefaultDevice: false }
+    } catch (error) {
+      const name = nameOf(error)
+      attempts.push(`指定设备 ${name}`)
+      const deviceGone = name === 'OverconstrainedError' || name === 'NotFoundError' || name === 'DevicesNotFoundError'
+      // 设备确实不在了 → 回退；权限被拒等原样抛出（回退也开不了，不能掩盖真原因）
+      if (!deviceGone) {
+        throw micError(name)
+      }
+      console.warn('[AudioCapture] 指定麦克风不可用，回退默认设备：', name)
+    }
+  }
+
+  /*
+   * 默认设备也失败时给一次短延迟重试。
+   *
+   * 典型场景：设备检查刚关掉麦克风、立刻又开一次，macOS 释放 CoreAudio 设备
+   * 需要一点时间，这时会抛 NotReadableError（Could not start audio source）。
+   * 等一拍再来一次通常就好了 —— 不重试的话表现就是"偶尔开不了麦"。
+   */
+  const openDefault = async (): Promise<MediaStream> => {
+    try {
+      return await getUserMedia({ audio: base })
+    } catch (error) {
+      const name = nameOf(error)
+      attempts.push(`默认设备 ${name}`)
+      if (name !== 'NotReadableError' && name !== 'AbortError') {
+        throw micError(name)
+      }
+      await new Promise((resolve) => setTimeout(resolve, 300))
+      try {
+        return await getUserMedia({ audio: base })
+      } catch (retryError) {
+        const retryName = nameOf(retryError)
+        attempts.push(`重试 ${retryName}`)
+        throw micError(retryName)
+      }
+    }
+  }
+
+  return { stream: await openDefault(), usedDefaultDevice: Boolean(deviceId) }
+}
+
+/**
+ * 选出 ScriptProcessor 合法的缓冲区大小。
+ *
+ * 硬约束来自 WebAudio：必须是 **256 ~ 16384 之间的 2 的幂**（或 0 让浏览器自己选）。
+ * 之前按「原生采样率 × 0.1」算，48kHz 会得到 4800 —— 不是 2 的幂，
+ * `createScriptProcessor` 直接抛异常，于是**麦克风整条链路都建不起来**
+ * （表现就是 [mic] Failed to execute 'createScriptProcessor'…）。
+ *
+ * 取「不超过目标值的最大的 2 的幂」，既接近 100ms 的理想帧长，又一定合法：
+ *   48000 → 4096（85ms）  44100 → 4096（93ms）  16000 → 1024（64ms）
+ */
+export function pickScriptProcessorBufferSize(nativeRate: number): number {
+  const target = Math.max(256, Math.round(nativeRate * 0.1))
+  let size = 256
+  while (size * 2 <= Math.min(16384, target)) size *= 2
+  return size
+}
+
 export class AudioCapture {
   private pipelines = new Map<AudioSource, SourcePipeline>()
   private frameHandlers: Array<(pcm: Int16Array, source: AudioSource) => void> = []
   private errorHandlers: Array<(scope: string, message: string) => void> = []
+  private deviceFallbackHandlers: Array<() => void> = []
   /** 原生系统音频通道的清理函数 */
   private nativeStop: (() => void) | null = null
   private nativeLevel = 0
@@ -175,6 +273,11 @@ export class AudioCapture {
 
   onError(cb: (scope: string, message: string) => void): void {
     this.errorHandlers.push(cb)
+  }
+
+  /** 指定的麦克风不可用、已回退到系统默认设备时触发 */
+  onDeviceFallback(cb: () => void): void {
+    this.deviceFallbackHandlers.push(cb)
   }
 
   /** 0-1 的输入电平，用于 UI 显示 */
@@ -222,14 +325,11 @@ export class AudioCapture {
   }
 
   private async startMic(deviceId?: string): Promise<void> {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        deviceId: deviceId ? { exact: deviceId } : undefined,
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true
-      }
-    })
+    const { stream, usedDefaultDevice } = await openMicStream(deviceId)
+    if (usedDefaultDevice) {
+      // 告诉上层：失效的 deviceId 该清掉了，否则每次启动都白试一次
+      for (const handler of this.deviceFallbackHandlers) handler()
+    }
     this.attach('mic', stream)
   }
 
@@ -345,7 +445,8 @@ export class AudioCapture {
     const context = new AudioContext()
     const nativeRate = context.sampleRate
     // 按原生率换算 100ms 的帧长，保证每帧时间粒度一致
-    const frameSamples = Math.max(256, Math.round(nativeRate * 0.1))
+    // 必须是 2 的幂（WebAudio 硬约束，否则直接抛异常）
+    const frameSamples = pickScriptProcessorBufferSize(nativeRate)
     const mediaSource = context.createMediaStreamSource(stream)
     const node = context.createScriptProcessor(frameSamples, 1, 1)
     // 音轨显式启用：某些设备返回的轨道默认是 disabled 的
@@ -378,7 +479,11 @@ export class AudioCapture {
   }
 
   private fail(scope: AudioSource, error: unknown): void {
-    const message = error instanceof Error ? error.message : String(error)
+    // DOMException 的 message 经常是空的/含糊的，name 反而最有信息量
+    const message =
+      error instanceof Error
+        ? error.message || error.name || String(error)
+        : String(error)
     for (const handler of this.errorHandlers) handler(scope, message)
   }
 }

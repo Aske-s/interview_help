@@ -225,6 +225,15 @@ export default function App(): React.ReactElement {
       const capture = new AudioCapture()
       capture.onFrame((pcm, source) => api.live.pushAudio(pcm.buffer as ArrayBuffer, source))
       capture.onError((scope, message) => setError(`[${scope}] ${message}`))
+      /*
+       * 上次选的麦克风可能已经失效（deviceId 是按 profile 加盐的哈希，会变）。
+       * 已经自动回退到默认设备了，这里顺手把失效的选择清掉，
+       * 否则每次开始会话都要白试一次。
+       */
+      capture.onDeviceFallback(() => {
+        setError('原来选的麦克风已不可用，已自动切换到系统默认麦克风。')
+        void api.settings.patch({ audio: { micDeviceId: '' } })
+      })
       captureRef.current = capture
       await capture.start({
         mic: settings.audio.micEnabled,

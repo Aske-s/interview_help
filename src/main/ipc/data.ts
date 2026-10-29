@@ -48,6 +48,23 @@ export function appendQa(sessionId: string, qa: QaRecord): void {
   sessions.upsert(session)
 }
 
+/**
+ * 给某一轮问答补上「候选人实际说了什么」。
+ *
+ * 为什么不直接在 appendQa 时给：一轮问答的时序是
+ *   面试官问 → 我们出建议（几秒） → 候选人回答（几十秒） → 面试官问下一句
+ * 候选人说完时这条 QaRecord 往往已经落库了，只能回填。
+ */
+export function attachMyAnswer(sessionId: string, qaId: string, myAnswer: string): void {
+  const session = sessions.get(sessionId)
+  if (!session) return
+  const record = session.qa.find((item) => item.id === qaId)
+  if (!record || record.myAnswer === myAnswer) return
+  record.myAnswer = myAnswer
+  session.updatedAt = Date.now()
+  sessions.upsert(session)
+}
+
 export function registerDataIpc(): void {
   /* ---- 会话 ---- */
   ipcMain.handle(IPC.SessionList, (_e, kind?: SessionKind) => {

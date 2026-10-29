@@ -54,7 +54,9 @@ const api: MainWindowApi = {
 
   knowledge: {
     list: () => invoke(IPC.KbList),
-    create: (name, description) => invoke(IPC.KbCreate, name, description),
+    create: (name, description, purpose) => invoke(IPC.KbCreate, name, description, purpose),
+    setPurpose: (kbId, purpose) => invoke(IPC.KbSetPurpose, kbId, purpose),
+    distillResume: (kbId) => invoke(IPC.KbDistillResume, kbId),
     remove: (id) => invoke(IPC.KbDelete, id),
     addDocument: (kbId, payload) => invoke(IPC.KbAddDocument, kbId, payload),
     removeDocument: (docId) => invoke(IPC.KbRemoveDocument, docId),

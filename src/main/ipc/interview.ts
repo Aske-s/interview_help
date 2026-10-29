@@ -1,3 +1,4 @@
+import { contextByPurpose } from '../knowledge'
 import { ipcMain } from 'electron'
 import { IPC } from '@shared/ipc'
 import { basename } from 'node:path'
@@ -27,7 +28,17 @@ export function registerInterviewIpc(): void {
    * 两种形态都要能工作。
    */
   ipcMain.handle(IPC.InterviewCreate, (_e, configOrRole: InterviewConfig | string, background?: string) => {
-    return typeof configOrRole === 'string' ? createInterview(configOrRole, background ?? '') : createInterview(configOrRole)
+    /*
+     * 没手填背景资料时，自动用「简历」用途的知识库。
+     * 用户已经把简历维护进知识库了，再让他上传一遍没道理；
+     * 面试官据此出题也会更贴岗位。
+     */
+    const fallbackResume = (text?: string): string =>
+      text?.trim() ? text : contextByPurpose('resume', 3000)
+
+    return typeof configOrRole === 'string'
+      ? createInterview(configOrRole, fallbackResume(background))
+      : createInterview({ ...configOrRole, background: fallbackResume(configOrRole.background) })
   })
 
   ipcMain.handle(IPC.InterviewStart, (_e, id: string) => startInterview(id))

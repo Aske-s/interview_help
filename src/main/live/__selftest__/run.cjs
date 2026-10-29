@@ -340,8 +340,9 @@ async function main() {
     JSON.stringify(roles)
   )
   check(
-    '上下文：历史 user 轮是上一轮的问题',
-    secondReq?.messages?.[1]?.content === '第一个问题：介绍一下你的项目',
+    '上下文：历史 user 轮是上一轮的问题（带说话人标注）',
+    String(secondReq?.messages?.[1]?.content ?? '').includes('第一个问题：介绍一下你的项目') &&
+      String(secondReq?.messages?.[1]?.content ?? '').startsWith('面试官：'),
     JSON.stringify(secondReq?.messages?.[1]?.content)
   )
   check(
@@ -374,7 +375,7 @@ async function main() {
     '上下文：只带最近 1 轮（轮数上限生效）',
     limited.length === 4 &&
       limited.filter((m) => m.role === 'assistant').length === 1 &&
-      limited[1].content === '问题 B',
+      String(limited[1].content).includes('问题 B') && String(limited[1].content).startsWith('面试官：'),
     JSON.stringify(limited.map((m) => `${m.role}:${String(m.content).slice(0, 8)}`))
   )
   live.stop()
@@ -409,6 +410,159 @@ async function main() {
   await sleep(150)
   check('clear：清空后创建新会话', live.getState().sessionId !== beforeSession, live.getState().sessionId)
   live.stop()
+
+  /* ---------- 面试上下文：我实际怎么答的 ---------- */
+  /*
+   * 场景：面试官问 → 我给建议 → 我照着说/自己说 → 面试官追问。
+   * 追问锚定在我上一轮说的**具体细节**上，所以上下文必须同时有
+   * 「面试官问什么」「我实际说了什么」「当时建议了什么」。
+   */
+  const feedSource = async (seconds, kind, source) => {
+    const chunk = 0.1
+    for (let i = 0; i < Math.round(seconds / chunk); i++) {
+      live.pushAudio(kind === 'silence' ? silence(chunk) : speech(chunk), source)
+      await sleep(4)
+    }
+  }
+  settingsStore.patch({
+    audio: { ...settingsStore.get().audio, micEnabled: true, systemAudioEnabled: true },
+    asrTuning: { ...settingsStore.get().asrTuning, silenceMs: 300, minSegmentMs: 200, maxSegmentMs: 4000, cumulative: false, autoAnswer: true, autoAnswerMinChars: 2 },
+    agents: settingsStore.get().agents.map((a, i) => (i === 0 ? { ...a, memoryRounds: 5 } : a))
+  })
+  live.start('meeting')
+  await sleep(200)
+  const ctxBefore = streamCalls.length
+
+  // 1) 我先说一句：绝不能被当成问题去提问
+  asrTexts = ['我在上个项目负责缓存与一致性设计']
+  await feedSource(1.2, 'speech', 'mic')
+  await feedSource(0.8, 'silence', 'mic')
+  await sleep(2200)
+  check('我方发言不触发提问', streamCalls.length === ctxBefore, `多出 ${streamCalls.length - ctxBefore} 次`)
+
+  // 2) 面试官问第一题 → 触发；首轮把我刚说的那句带上
+  asrTexts = ['你那个缓存方案怎么保证一致性']
+  await feedSource(1.2, 'speech', 'system')
+  await feedSource(0.9, 'silence', 'system')
+  await sleep(2500)
+  check('面试官发言触发提问', streamCalls.length === ctxBefore + 1, `${streamCalls.length - ctxBefore} 次`)
+  const firstMsgs = streamCalls[ctxBefore]?.req?.messages ?? []
+  const firstCtx = JSON.stringify(firstMsgs)
+  check('首轮上下文带上了我刚才说的话', firstCtx.includes('我实际回答') && firstCtx.includes('缓存与一致性设计'), firstCtx.slice(0, 120))
+
+  // 3) 我回答第一题（两段，验证会拼接）
+  asrTexts = ['我用的是本地缓存加过期时间', '一致性靠双删加延迟补偿']
+  await feedSource(1.2, 'speech', 'mic')
+  await feedSource(0.7, 'silence', 'mic')
+  await sleep(1800)
+  await feedSource(1.2, 'speech', 'mic')
+  await feedSource(0.7, 'silence', 'mic')
+  await sleep(1800)
+  check('我的两段回答都进上下文缓冲（不触发提问）', streamCalls.length === ctxBefore + 1, `多出 ${streamCalls.length - ctxBefore - 1} 次`)
+
+  // 4) 面试官追问 → 上下文里应有「问题 + 我实际回答 + 当时建议」
+  asrTexts = ['那如果缓存和数据库不一致怎么办']
+  await feedSource(1.2, 'speech', 'system')
+  await feedSource(0.9, 'silence', 'system')
+  await sleep(2500)
+  const secondMsgs = streamCalls[ctxBefore + 1]?.req?.messages ?? []
+  const secondCtx = JSON.stringify(secondMsgs)
+  check('追问时带上了上一轮的问题', secondCtx.includes('你那个缓存方案怎么保证一致性'), secondCtx.slice(0, 100))
+  check(
+    '追问时带上了我的实际回答（两段已拼接）',
+    secondCtx.includes('本地缓存加过期时间') && secondCtx.includes('双删加延迟补偿')
+  )
+  check('追问时带上了当时的建议', secondMsgs.some((m) => m.role === 'assistant'))
+  check(
+    '上下文顺序：上一轮在前，当前问题在最后',
+    secondMsgs[secondMsgs.length - 1]?.content === '那如果缓存和数据库不一致怎么办',
+    String(secondMsgs[secondMsgs.length - 1]?.content).slice(0, 40)
+  )
+
+  // 5) 我实际怎么答的会落库（复盘要用）
+  await sleep(300)
+  const sess = sessions.get(live.getState().sessionId)
+  const withAnswer = (sess?.qa ?? []).filter((q) => q.myAnswer)
+  check('落库：问答记录里存了「我实际回答」', withAnswer.length > 0, `${withAnswer.length} 条`)
+  check(
+    '落库：内容是我说的原话',
+    String(withAnswer[0]?.myAnswer ?? '').includes('本地缓存加过期时间'),
+    String(withAnswer[0]?.myAnswer ?? '').slice(0, 60)
+  )
+  live.stop()
+  await sleep(200)
+
+  /* 只开麦克风（面对面）时，麦克风仍然是提问来源 */
+  settingsStore.patch({ audio: { ...settingsStore.get().audio, micEnabled: true, systemAudioEnabled: false } })
+  live.start('meeting')
+  await sleep(200)
+  const faceBefore = streamCalls.length
+  asrTexts = ['面对面场景下对方直接问我']
+  await feedSource(1.2, 'speech', 'mic')
+  await feedSource(0.9, 'silence', 'mic')
+  await sleep(2500)
+  check('只开麦克风时，麦克风仍会触发提问（面对面场景）', streamCalls.length > faceBefore, `${streamCalls.length - faceBefore} 次`)
+  live.stop()
+  await sleep(200)
+  settingsStore.patch({ audio: { ...settingsStore.get().audio, micEnabled: false, systemAudioEnabled: true } })
+
+  /* ---------- 简历知识库：整份注入助答 ---------- */
+  /*
+   * 面试里大量问题是「介绍一下你自己 / 讲讲你的项目」，靠相似度检索不稳
+   * （问题里不含简历的关键名词时捞不到），所以简历必须整份进提示词。
+   */
+  const { knowledgeStore } = require(path.join(ROOT, 'src/main/knowledge/store.ts'))
+  knowledgeStore.kbs.upsert({
+    id: 'kb-resume-test',
+    name: '我的简历',
+    purpose: 'resume',
+    createdAt: Date.now() - 10,
+    updatedAt: Date.now() + 100000
+  })
+  knowledgeStore.docs.upsert({
+    id: 'doc-resume-test',
+    kbId: 'kb-resume-test',
+    name: '简历.md',
+    chars: 30,
+    chunks: 1,
+    createdAt: Date.now()
+  })
+  knowledgeStore.chunks.appendMany('kb-resume-test', [
+    {
+      id: 'chunk-resume-test',
+      kbId: 'kb-resume-test',
+      docId: 'doc-resume-test',
+      docName: '简历.md',
+      text: '我有 8 年后端经验，主导过支付系统重构，熟悉 MySQL 与 Redis。'
+    }
+  ])
+  live.start('meeting')
+  await sleep(200)
+  live.ask('介绍一下你自己', 'manual')
+  await sleep(700)
+  const resumeMsgs = streamCalls[streamCalls.length - 1]?.req?.messages ?? []
+  const sysText = String(resumeMsgs[0]?.content ?? '')
+  check('简历知识库：整份注入到系统提示词', sysText.includes('【我的简历 / 背景】'), sysText.includes('【我的简历 / 背景】') ? '' : sysText.slice(0, 80))
+  check('简历知识库：内容确实进去了', sysText.includes('8 年后端经验') && sysText.includes('支付系统重构'))
+  check('简历知识库：明确要求不编造经历', sysText.includes('不要编造经历'))
+
+  // 有速查卡时只注入速查卡（更短更精炼），不再塞原文
+  const resumeKb = knowledgeStore.kbs.all().find((kb) => kb.id === 'kb-resume-test')
+  resumeKb.profile = '基本信息：8 年 / 后端 / 本科\n技术栈：Go, MySQL, Redis\n项目经历：支付系统｜重构｜亮点：资损 0'
+  resumeKb.profileAt = Date.now()
+  knowledgeStore.kbs.upsert(resumeKb)
+  live.ask('你的项目里最难的点是什么', 'manual')
+  await sleep(700)
+  const profileMsgs = streamCalls[streamCalls.length - 1]?.req?.messages ?? []
+  const profileSys = String(profileMsgs[0]?.content ?? '')
+  check('简历速查卡：注入的是速查卡', profileSys.includes('（速查卡）'), profileSys.length + ' 字')
+  check('简历速查卡：速查卡内容进去了', profileSys.includes('技术栈：Go') && profileSys.includes('资损 0'))
+  check(
+    '简历速查卡：不再重复塞简历原文（省上下文）',
+    !profileSys.includes('主导过支付系统重构，熟悉 MySQL 与 Redis。')
+  )
+  live.stop()
+  await sleep(150)
 
   /* ---------- 开始会话的入口只能有一个 ---------- */
   /*
